@@ -173,23 +173,43 @@ pub fn spawn(
         .default_input_config()
         .map_err(|e| format!("device default config: {}", e))?;
 
-    // Safety net for corrupt persisted config: clamp the requested rate
-    // to one the device actually supports and the modem can decode (never
-    // above MODEM_MAX_SAMPLE_RATE). A stale `sample_rate=96000` from a
-    // plughw device that really runs 48 kHz is rejected here instead of
-    // silently desyncing the demod's bit timing.
-    let supported_ranges: Vec<(u32, u32)> = device
+    // Device-advertised (channels, format, min_rate, max_rate) configs.
+    // Never trust default_input_config()'s format: on an ALSA plughw:/
+    // default PCM it is F32, which POLLERR-loops cpal forever on cheap USB
+    // radio codecs. We drive both the rate decision and the format pick
+    // from these advertised configs so the two can't disagree about what
+    // the hardware actually offers.
+    let input_cfgs: Vec<(u16, SampleFormat, u32, u32)> = device
         .supported_input_configs()
-        .map(|it| it.map(|c| (c.min_sample_rate(), c.max_sample_rate())).collect())
+        .map(|it| {
+            it.map(|c| {
+                (
+                    c.channels(),
+                    c.sample_format(),
+                    c.min_sample_rate(),
+                    c.max_sample_rate(),
+                )
+            })
+            .collect()
+        })
         .unwrap_or_default();
-    let stream_rate = choose_stream_rate(
+
+    // Safety net for corrupt persisted config plus the F32 POLLERR trap:
+    // clamp the requested rate to one the device supports and the modem can
+    // decode (never above MODEM_MAX_SAMPLE_RATE), preferring a rate where
+    // the device advertises native I16. A stale `sample_rate=96000` from a
+    // plughw device that really runs 48 kHz is rejected here; so is a
+    // 44.1 kHz request on a codec (C-Media on the Pi Zero) that only
+    // advertises F32 at 44.1 kHz but native I16 at 48 kHz -- opening the
+    // F32 stream POLLERR-loops cpal (invariant 33).
+    let stream_rate = choose_stream_rate_for_format(
         cfg.sample_rate,
         supported.sample_rate(),
-        &supported_ranges,
+        &input_cfgs,
     );
     if stream_rate != cfg.sample_rate {
         eprintln!(
-            "graywolf-modem: input rate {} Hz unsupported/corrupt; opening at {} Hz instead",
+            "graywolf-modem: input rate {} Hz unsupported/corrupt or F32-only; opening at {} Hz instead",
             cfg.sample_rate, stream_rate
         );
     }
@@ -218,26 +238,10 @@ pub fn spawn(
     // own thread that also runs a small park loop to keep it alive.
     let stop_for_thread = stop.clone();
     let stream_failed_for_thread = stream_failed.clone();
-    // Never trust default_input_config()'s format: on an ALSA plughw:/
-    // default PCM it is F32, which POLLERR-loops cpal forever on cheap
-    // USB radio codecs (AIOC). Pick the format the device actually
-    // advertises at our rate, preferring native I16 (what arecord and
-    // the detection probe use and what streams reliably). Fall back to
-    // the cpal default only if the device advertises nothing usable.
-    let input_cfgs: Vec<(u16, SampleFormat, u32, u32)> = device
-        .supported_input_configs()
-        .map(|it| {
-            it.map(|c| {
-                (
-                    c.channels(),
-                    c.sample_format(),
-                    c.min_sample_rate(),
-                    c.max_sample_rate(),
-                )
-            })
-            .collect()
-        })
-        .unwrap_or_default();
+    // Pick the format the device actually advertises at our chosen rate,
+    // preferring native I16 (what arecord and the detection probe use and
+    // what streams reliably). Fall back to the cpal default only if the
+    // device advertises nothing usable.
     // Format and channels are chosen independently (rate-filtered): a
     // converting `plughw:`/`default` PCM accepts any (channels, format)
     // pair via software conversion, which is the only realistic graywolf
@@ -759,6 +763,86 @@ pub fn choose_stream_rate(requested: u32, native: u32, supported: &[(u32, u32)])
         return native;
     }
     ceiling
+}
+
+/// Decide the rate to open a stream at, preferring one where the device
+/// advertises native `I16`.
+///
+/// This builds on [`choose_stream_rate`] (the corrupt-config / ceiling
+/// clamp) by also dodging the `F32` POLLERR trap (invariant 33) at the
+/// *rate* level. Some cheap USB codecs -- notably the C-Media chip on a
+/// Raspberry Pi Zero -- advertise *only* `F32` at the CD-standard 44.1 kHz
+/// graywolf defaults to, while advertising native `I16` only at 48 kHz.
+/// Opening the `F32` stream makes cpal `alsa::poll()` return `POLLERR`
+/// every period; the holding thread rebuilds with the same bad format and
+/// loops forever, so TX audio never reaches the rig even though PTT keys.
+/// Picking the `I16` rate up front avoids that entirely. Both directions
+/// share this so capture and playback can't drift.
+///
+/// `requested` is honored when it is sane (nonzero, `<= ceiling`) and the
+/// device advertises native `I16` there. Otherwise, when the device
+/// advertises `I16` at any rate `<= ceiling`, the closest such rate to
+/// `requested` is chosen (ties prefer the higher rate, so 48 kHz wins).
+/// When the device advertises no `I16` at all, falls back to
+/// [`choose_stream_rate`] -- the format picker's own `F32` fallback then
+/// handles the (rare) I16-less device.
+pub fn choose_stream_rate_for_format(
+    requested: u32,
+    native: u32,
+    configs: &[(u16, SampleFormat, u32, u32)],
+) -> u32 {
+    let ceiling = super::MODEM_MAX_SAMPLE_RATE;
+    let i16_covers = |r: u32| {
+        configs
+            .iter()
+            .any(|&(_ch, f, min, max)| f == SampleFormat::I16 && r >= min && r <= max)
+    };
+
+    if requested != 0 && requested <= ceiling && i16_covers(requested) {
+        return requested;
+    }
+
+    // Collect candidate rates at which the device advertises native I16,
+    // capped at the modem ceiling: every standard rate the I16 ranges
+    // cover, plus each range's own (capped) endpoints so an oddball native
+    // rate isn't missed.
+    let mut candidates: Vec<u32> = Vec::new();
+    for &(_ch, f, min, max) in configs {
+        if f != SampleFormat::I16 {
+            continue;
+        }
+        for &r in super::STANDARD_SAMPLE_RATES {
+            if r >= min && r <= max && r <= ceiling {
+                candidates.push(r);
+            }
+        }
+        if min != 0 && min <= ceiling {
+            candidates.push(min);
+        }
+        let capped_max = max.min(ceiling);
+        if capped_max != 0 {
+            candidates.push(capped_max);
+        }
+    }
+    candidates.retain(|&r| r != 0);
+    if candidates.is_empty() {
+        // No native I16 anywhere: keep the rate-only behavior; the format
+        // picker's F32 fallback handles the I16-less device.
+        let ranges: Vec<(u32, u32)> =
+            configs.iter().map(|&(_c, _f, min, max)| (min, max)).collect();
+        return choose_stream_rate(requested, native, &ranges);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    // Pick the candidate closest to the requested rate; on a tie prefer the
+    // higher rate (so 48 kHz wins over a lower I16 rate when the request
+    // sits between them).
+    let target = if requested == 0 { ceiling } else { requested.min(ceiling) };
+    candidates
+        .into_iter()
+        .min_by_key(|&r| (r.abs_diff(target), u32::MAX - r))
+        .unwrap_or(ceiling)
 }
 
 /// Briefly open `dev` for capture and report whether it actually streams.
@@ -1398,6 +1482,66 @@ mod tests {
         assert_eq!(choose_stream_rate(0, 48_000, &[(8_000, 48_000)]), 48_000);
         // requested not covered by any supported range → native.
         assert_eq!(choose_stream_rate(44_100, 48_000, &[(48_000, 48_000)]), 48_000);
+    }
+
+    #[test]
+    fn choose_rate_for_format_bumps_to_i16_when_requested_only_offers_f32() {
+        // The reported C-Media-on-Pi-Zero case: F32 across a wide synthetic
+        // plug range, native I16 only at 48 kHz. A 44.1 kHz request offers
+        // only F32 there, which POLLERR-loops cpal on output → bump to the
+        // 48 kHz I16 rate so the stream actually carries TX audio.
+        let cfgs = [
+            (2u16, SampleFormat::F32, 4_000u32, 48_000u32),
+            (1u16, SampleFormat::I16, 48_000u32, 48_000u32),
+        ];
+        assert_eq!(choose_stream_rate_for_format(44_100, 48_000, &cfgs), 48_000);
+    }
+
+    #[test]
+    fn choose_rate_for_format_honors_request_when_i16_covers_it() {
+        let cfgs = [
+            (1u16, SampleFormat::I16, 8_000u32, 48_000u32),
+            (2u16, SampleFormat::F32, 4_000u32, 48_000u32),
+        ];
+        assert_eq!(choose_stream_rate_for_format(44_100, 48_000, &cfgs), 44_100);
+        assert_eq!(choose_stream_rate_for_format(48_000, 48_000, &cfgs), 48_000);
+    }
+
+    #[test]
+    fn choose_rate_for_format_picks_closest_i16_rate() {
+        // I16 offered only at 16k and 48k.
+        let cfgs = [
+            (1u16, SampleFormat::I16, 16_000u32, 16_000u32),
+            (1u16, SampleFormat::I16, 48_000u32, 48_000u32),
+        ];
+        // 44.1k → 48k is closest.
+        assert_eq!(choose_stream_rate_for_format(44_100, 48_000, &cfgs), 48_000);
+        // 22.05k → 16k is closer than 48k.
+        assert_eq!(choose_stream_rate_for_format(22_050, 48_000, &cfgs), 16_000);
+    }
+
+    #[test]
+    fn choose_rate_for_format_falls_back_when_no_i16_advertised() {
+        // Only F32 anywhere: keep the rate-only behavior so the format
+        // picker's F32 fallback handles the (rare) I16-less device.
+        let f32_only = [(2u16, SampleFormat::F32, 8_000u32, 48_000u32)];
+        assert_eq!(choose_stream_rate_for_format(44_100, 48_000, &f32_only), 44_100);
+        // No configs at all → identical to choose_stream_rate.
+        assert_eq!(
+            choose_stream_rate_for_format(44_100, 48_000, &[]),
+            choose_stream_rate(44_100, 48_000, &[]),
+        );
+        // Corrupt above-ceiling request with only F32 still gets clamped.
+        let f32_wide = [(2u16, SampleFormat::F32, 8_000u32, 192_000u32)];
+        assert_eq!(choose_stream_rate_for_format(96_000, 48_000, &f32_wide), 48_000);
+    }
+
+    #[test]
+    fn choose_rate_for_format_never_exceeds_ceiling() {
+        // I16 advertised above the ceiling must still be capped to 48 kHz.
+        let cfgs = [(1u16, SampleFormat::I16, 8_000u32, 192_000u32)];
+        assert!(choose_stream_rate_for_format(96_000, 48_000, &cfgs) <= super::super::MODEM_MAX_SAMPLE_RATE);
+        assert_eq!(choose_stream_rate_for_format(96_000, 48_000, &cfgs), 48_000);
     }
 
     /// Helper: turn a slice of mono samples into the `next()` closure the

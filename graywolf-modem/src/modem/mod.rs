@@ -163,13 +163,16 @@ pub struct Modem {
     // hardware, so these must be resolved while the device is idle.
     output_devices: HashMap<u32, cpal::Device>,
 
-    // Pre-negotiated output stream params (channels + sample_format),
-    // cached at start_audio time when the device is idle. The TX
-    // path uses these to avoid calling supported_output_configs()
-    // on a device cpal has lost the ability to enumerate (e.g. while a
-    // capture stream is active on the same AIOC hardware, or after a
-    // USB-EMI hub event invalidates the cached handle).
-    output_configs_cache: HashMap<u32, (u16, cpal::SampleFormat)>,
+    // Resolved output sample rate per device_id, computed at start_audio
+    // time while the device is idle (cpal cannot enumerate a device once a
+    // capture stream holds it). This is the rate TX audio is *both*
+    // synthesized at and the output stream is opened at -- the two must
+    // match or the AFSK tones come out at the wrong pitch/timing. It
+    // prefers a rate where the device advertises native I16, dodging the
+    // F32 POLLERR trap (invariant 33) that silences TX on cheap USB codecs
+    // (C-Media on the Pi Zero) which only offer F32 at the configured
+    // 44.1 kHz but native I16 at 48 kHz.
+    output_resolved_rate: HashMap<u32, u32>,
 
     // Active audio pipelines, keyed by device_id
     active_devices: HashMap<u32, DevicePipeline>,
@@ -212,7 +215,7 @@ impl Modem {
             dcd_transitions: HashMap::new(),
             last_status_tx: Instant::now(),
             last_level_tx: HashMap::new(),
-            output_configs_cache: HashMap::new(),
+            output_resolved_rate: HashMap::new(),
         })
     }
 
@@ -391,7 +394,7 @@ impl Modem {
         // supported_output_configs() (which fails once an input capture
         // stream holds the same hardware).
         self.output_devices.clear();
-        self.output_configs_cache.clear();
+        self.output_resolved_rate.clear();
         let mut seen_outputs = std::collections::HashSet::new();
         for ccfg in self.channel_configs.values() {
             let dev_id = ccfg.output_device_id;
@@ -401,29 +404,54 @@ impl Modem {
             if let Some(acfg) = self.audio_configs.get(&dev_id) {
                 match audio::soundcard::resolve_output_device(&acfg.device_name) {
                     Ok(device) => {
-                        // Pre-negotiate the (channels, sample_format) pair
-                        // while the device is idle. supported_output_configs()
-                        // tends to fail later when the AIOC's input PCM is
-                        // actively captured. negotiate_channels() falls back
-                        // gracefully if the configured channel count isn't
-                        // supported (e.g. stereo-only USB cards).
-                        let preferred_ch = acfg.channels.max(1) as u16;
-                        let neg = audio::soundcard::negotiate_channels(
-                            &device, acfg.sample_rate, preferred_ch, "output",
-                            |d| { use cpal::traits::DeviceTrait; d.supported_output_configs() },
-                        );
-                        let fmt = {
+                        // Resolve the output rate while the device is idle.
+                        // supported_output_configs() tends to fail later
+                        // when the input PCM of the same card is actively
+                        // captured, so we must do it here. Prefer a rate
+                        // where the device advertises native I16: a 44.1 kHz
+                        // request on a codec that only offers F32 there (but
+                        // I16 at 48 kHz) would POLLERR-loop the output stream
+                        // and silence TX (invariant 33). The chosen rate is
+                        // used for BOTH synthesis and stream open so the AFSK
+                        // tones come out at the right pitch.
+                        let output_cfgs: Vec<(u16, cpal::SampleFormat, u32, u32)> = {
                             use cpal::traits::DeviceTrait;
-                            device.default_output_config().ok().map(|c| c.sample_format())
+                            device
+                                .supported_output_configs()
+                                .map(|it| {
+                                    it.map(|c| {
+                                        (
+                                            c.channels(),
+                                            c.sample_format(),
+                                            c.min_sample_rate(),
+                                            c.max_sample_rate(),
+                                        )
+                                    })
+                                    .collect()
+                                })
+                                .unwrap_or_default()
                         };
-                        if let (Ok(ch), Some(f)) = (neg, fmt) {
-                            self.output_configs_cache.insert(dev_id, (ch, f));
-                        } else {
+                        let native = {
+                            use cpal::traits::DeviceTrait;
+                            device.default_output_config().ok().map(|c| c.sample_rate()).unwrap_or(0)
+                        };
+                        let resolved = audio::soundcard::choose_stream_rate_for_format(
+                            acfg.sample_rate,
+                            native,
+                            &output_cfgs,
+                        );
+                        if output_cfgs.is_empty() {
                             eprintln!(
-                                "graywolf-modem: failed to pre-negotiate output configs for device_id={} ({}); TX may fail later if device gets busy",
-                                dev_id, acfg.device_name
+                                "graywolf-modem: failed to enumerate output configs for device_id={} ({}); TX rate stays {} Hz",
+                                dev_id, acfg.device_name, acfg.sample_rate
+                            );
+                        } else if resolved != acfg.sample_rate {
+                            eprintln!(
+                                "graywolf-modem: output device_id={} ({}): opening TX at {} Hz instead of {} Hz (native I16 rate)",
+                                dev_id, acfg.device_name, resolved, acfg.sample_rate
                             );
                         }
+                        self.output_resolved_rate.insert(dev_id, resolved);
                         self.tx_worker.prepare_output(dev_id, device.clone());
                         self.output_devices.insert(dev_id, device);
                     }
@@ -925,6 +953,20 @@ impl Modem {
         self.ptt_cfgs.insert(channel, cfg);
     }
 
+    /// The sample rate to actually transmit at on `device_id`: the rate
+    /// resolved at `start_audio` time (which prefers a native-I16 rate to
+    /// dodge the F32 POLLERR trap, invariant 33), falling back to the
+    /// configured `requested` rate if no resolution was cached (e.g. the
+    /// device failed to resolve at start, or TX on a device that was never
+    /// pre-resolved). This rate must be used for BOTH sample synthesis and
+    /// the output stream config so the two stay in lockstep.
+    fn tx_sample_rate(&self, device_id: u32, requested: u32) -> u32 {
+        self.output_resolved_rate
+            .get(&device_id)
+            .copied()
+            .unwrap_or(requested)
+    }
+
     /// Dispatch a single TransmitFrame: build AFSK samples on the IPC
     /// thread (pure DSP, sub-millisecond) and hand off to the TX worker
     /// for the slow I/O (sink creation, sample play-out, PTT sequencing,
@@ -963,6 +1005,11 @@ impl Modem {
             }
         };
 
+        // Transmit at the rate resolved when the device was idle, which may
+        // differ from the configured rate to land on a native-I16 stream
+        // (invariant 33). Synthesis and the output stream both use it.
+        let tx_rate = self.tx_sample_rate(ccfg.output_device_id, acfg.sample_rate);
+
         let ptt_cfg = self.ptt_cfgs.get(&tf.channel);
         let txdelay_ms = effective_ms(tf.txdelay_override_ms, ptt_cfg.map(|p| p.txdelay_ms), 300);
         let txtail_ms = effective_ms(tf.txtail_override_ms, ptt_cfg.map(|p| p.txtail_ms), 100);
@@ -974,7 +1021,7 @@ impl Modem {
             &tf.data,
             txdelay_ms,
             txtail_ms,
-            acfg.sample_rate,
+            tx_rate,
             ccfg.baud,
             ccfg.mark_freq,
             ccfg.space_freq,
@@ -994,7 +1041,7 @@ impl Modem {
         // keyed before any packet data goes out; the tone is part of the
         // TX buffer, so the output-gain multiplier below is applied to it
         // too. See [`vox_lead_in`] for the tone shape and level rationale.
-        if let Some(mut lead) = vox_lead_in(ptt_cfg, acfg.sample_rate, ccfg.mark_freq) {
+        if let Some(mut lead) = vox_lead_in(ptt_cfg, tx_rate, ccfg.mark_freq) {
             lead.extend_from_slice(&samples);
             samples = lead;
         }
@@ -1056,11 +1103,11 @@ impl Modem {
         let job = tx_worker::TxJob {
             channel: tf.channel,
             samples,
-            sample_rate: acfg.sample_rate,
+            sample_rate: tx_rate,
             output_device_id: ccfg.output_device_id,
             sink_config: audio::soundcard::SoundcardOutputConfig {
                 device_name: acfg.device_name.clone(),
-                sample_rate: acfg.sample_rate,
+                sample_rate: tx_rate,
                 channels: acfg.channels,
                 audio_channel: ccfg.output_channel,
             },
@@ -1110,6 +1157,11 @@ impl Modem {
                 return;
             }
         };
+
+        // Synthesize and open the output stream at the resolved (native-I16)
+        // rate, matching handle_transmit_frame so the test tone plays at the
+        // right pitch and doesn't POLLERR-loop the stream (invariant 33).
+        let sample_rate = self.tx_sample_rate(output_device_id, sample_rate);
 
         let mut samples = match req.kind {
             0 => {

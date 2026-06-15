@@ -555,13 +555,39 @@ is fine). `spawn_output` now selects the format the same way.
 
 The detection probe (`pick_input_probe_config`) and both runtime
 selectors share `native_format_rank`, so detection and runtime cannot
-drift. The sample-*rate* clamp (invariant 32) is necessary but
-independent: a clipping analog input or an `F32` plughw stream each
-kill audio on their own.
+drift.
+
+The format pick is not enough on its own, because format availability
+is *rate-dependent*: some cheap USB codecs (the C-Media chip on a
+Raspberry Pi Zero) advertise **only `F32`** at the CD-standard
+44.1 kHz graywolf defaults to, while advertising native `I16` only at
+48 kHz. At 44.1 kHz the format picker has nothing but `F32` to choose,
+so the POLLERR loop returns -- PTT keys but the rig hears silence
+because TX audio drains in ~1.4 s while the stream is stuck in the
+crash-rebuild backoff. The **rate** decision therefore also prefers a
+native-`I16` rate: `choose_stream_rate_for_format` (used by both `spawn`
+and the TX rate resolution) honors the requested rate only when the
+device advertises `I16` there, else bumps to the closest `I16` rate
+`<=` the 48 kHz ceiling (so 44.1 kHz -> 48 kHz on the C-Media chip).
+It falls back to the plain rate-only `choose_stream_rate` (invariant
+32) when the device advertises no `I16` anywhere.
+
+For **TX**, synthesis rate and stream rate must be the *same* value or
+the AFSK tones come out at the wrong pitch/timing. The modem resolves
+the output rate once, at `start_audio` time while the device is idle
+(cpal can't enumerate a device a capture stream holds), caches it in
+`Modem.output_resolved_rate`, and feeds it through
+`Modem.tx_sample_rate` into **both** `tx::build_samples` /
+`vox_lead_in` (synthesis) and the `SoundcardOutputConfig.sample_rate`
+the sink opens at. `spawn_output` opens at exactly that rate and only
+picks the format; it does not re-reconcile the rate, so it can't drift
+from what was synthesized.
 
 Source:
 [`../../graywolf-modem/src/audio/soundcard.rs`](../../graywolf-modem/src/audio/soundcard.rs)
-(`pick_input_sample_format`, `pick_output_sample_format`, `native_format_rank`, `pick_input_probe_config`, `spawn`, `spawn_output`).
+(`pick_input_sample_format`, `pick_output_sample_format`, `native_format_rank`, `pick_input_probe_config`, `choose_stream_rate_for_format`, `spawn`, `spawn_output`),
+[`../../graywolf-modem/src/modem/mod.rs`](../../graywolf-modem/src/modem/mod.rs)
+(`Modem.output_resolved_rate`, `tx_sample_rate`, `start_audio`, `handle_transmit_frame`, `handle_transmit_test_signal`).
 
 ### 34. KISS InterfaceType dispatch must be updated in two independent places
 
