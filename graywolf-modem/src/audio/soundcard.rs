@@ -219,15 +219,17 @@ pub fn spawn(
         |d| d.supported_input_configs(),
     )?;
 
-    // Capture buffer (ALSA period) target: ~100 ms of frames. cpal's
-    // BufferSize::Default opens a small ALSA buffer; on a single-core
-    // low-power host (Pi Zero / ARMv6) the cpal capture thread gets starved
-    // by the Go runtime + demod threads long enough to overrun that small
-    // buffer, which surfaces as "Buffer overrun occurred" and a crash-rebuild
-    // loop with RX dead. A larger buffer gives the same slack `arecord` uses
-    // by default. Built per stream-(re)build below so we can fall back to
-    // BufferSize::Default if a device rejects the fixed size.
-    let target_period: u32 = (stream_rate / 10).max(1024);
+    // Capture buffer target. cpal double-buffers BufferSize::Fixed(x) as
+    // period=x, buffer=2x, so the slack before an overrun is one period.
+    // cpal's BufferSize::Default opens a small ALSA buffer; on a single-core
+    // low-power host (Pi Zero / ARMv6) a periodic stall (Go runtime / demod
+    // burst) longer than that slack overruns the capture, surfacing as an
+    // ALSA XRUN/POLLERR. `arecord` survives the same load because its default
+    // buffer is ~500 ms. We match that: a ~250 ms period (=> ~500 ms buffer,
+    // ~250 ms slack). Latency is irrelevant for the RX path. Built per
+    // stream-(re)build below so we can fall back to BufferSize::Default if a
+    // device rejects the fixed size.
+    let target_period: u32 = (stream_rate / 4).max(2048);
 
     let want_ch = cfg.audio_channel as usize;
     let stop = Arc::new(AtomicBool::new(false));
@@ -269,32 +271,31 @@ pub fn spawn(
 
             while !stop_for_thread.load(Ordering::Relaxed) {
                 let stream_failed_for_err = stream_failed_for_thread.clone();
-                let mut last_err_log = Instant::now()
+                let mut last_underrun_log = Instant::now()
                     .checked_sub(Duration::from_secs(5))
                     .unwrap_or_else(Instant::now);
                 let err_fn = move |e: cpal::StreamError| {
                     match e {
-                        // Genuinely fatal: the device vanished or cpal says the
-                        // stream must be rebuilt. Trigger our rebuild path.
-                        cpal::StreamError::DeviceNotAvailable
-                        | cpal::StreamError::StreamInvalidated => {
-                            eprintln!("cpal input stream needs rebuild: {}", e);
-                            stream_failed_for_err.store(true, Ordering::Relaxed);
+                        // cpal recovers a BufferUnderrun in place (its XRun arm
+                        // calls prepare()/try_recover). Do NOT rebuild -- that
+                        // would churn the device for a glitch cpal already
+                        // handled. Log throttled.
+                        cpal::StreamError::BufferUnderrun => {
+                            if last_underrun_log.elapsed() >= Duration::from_secs(5) {
+                                eprintln!("cpal input buffer underrun (recovered in place)");
+                                last_underrun_log = Instant::now();
+                            }
                         }
-                        // Recoverable glitch (BufferUnderrun / BackendSpecific,
-                        // which is where ALSA POLLERR + XRUN land): cpal keeps
-                        // the stream alive and recovers in place, exactly as
-                        // arecord/aplay do. Tearing it down to rebuild here only
-                        // churns the device and, on a flaky USB codec (Pi Zero
-                        // CM108), provokes POLLERR storms. Log (throttled) and
-                        // let cpal recover -- invariant 49.
+                        // DeviceNotAvailable / StreamInvalidated / BackendSpecific
+                        // (where ALSA POLLERR lands): cpal does NOT recover from
+                        // these -- a POLLERR leaves the PCM wedged in the error
+                        // state, polling POLLERR every period forever. Our
+                        // rebuild (drop + reopen) is the recovery, analogous to
+                        // arecord's snd_pcm_recover. Dedup the log to one line
+                        // per rebuild cycle via the swap -- invariant 49.
                         other => {
-                            if last_err_log.elapsed() >= Duration::from_secs(5) {
-                                eprintln!(
-                                    "cpal input stream glitch (recovering in place): {}",
-                                    other
-                                );
-                                last_err_log = Instant::now();
+                            if !stream_failed_for_err.swap(true, Ordering::Relaxed) {
+                                eprintln!("cpal input stream error, rebuilding: {}", other);
                             }
                         }
                     }
@@ -1168,29 +1169,29 @@ pub fn spawn_output(cfg: SoundcardOutputConfig, device: Option<Device>) -> Resul
 
             while !stop_for_thread.load(Ordering::Relaxed) {
                 let stream_failed_for_err = stream_failed_for_thread.clone();
-                let mut last_err_log = Instant::now()
+                let mut last_underrun_log = Instant::now()
                     .checked_sub(Duration::from_secs(5))
                     .unwrap_or_else(Instant::now);
                 let err_fn = move |e: cpal::StreamError| {
                     match e {
-                        // Fatal: device gone / stream invalidated -> rebuild.
-                        cpal::StreamError::DeviceNotAvailable
-                        | cpal::StreamError::StreamInvalidated => {
-                            eprintln!("cpal output stream needs rebuild: {}", e);
-                            stream_failed_for_err.store(true, Ordering::Relaxed);
+                        // cpal recovers a BufferUnderrun in place (try_recover on
+                        // the writei EPIPE path). Don't rebuild -- a rebuild
+                        // mid-transmission would truncate TX audio for a glitch
+                        // cpal already handled. Log throttled.
+                        cpal::StreamError::BufferUnderrun => {
+                            if last_underrun_log.elapsed() >= Duration::from_secs(5) {
+                                eprintln!("cpal output buffer underrun (recovered in place)");
+                                last_underrun_log = Instant::now();
+                            }
                         }
-                        // Recoverable (BufferUnderrun / BackendSpecific incl.
-                        // ALSA POLLERR + XRUN): cpal recovers in place like
-                        // aplay. Don't tear down -- a rebuild mid-transmission
-                        // truncates TX audio and churns a flaky USB codec.
-                        // Log (throttled) and let cpal recover -- invariant 49.
+                        // DeviceNotAvailable / StreamInvalidated / BackendSpecific
+                        // (ALSA POLLERR): cpal does NOT recover from these; the
+                        // PCM stays wedged. Rebuild (drop + reopen) is the
+                        // recovery so the next transmission works. Dedup the log
+                        // to one per rebuild cycle -- invariant 49.
                         other => {
-                            if last_err_log.elapsed() >= Duration::from_secs(5) {
-                                eprintln!(
-                                    "cpal output stream glitch (recovering in place): {}",
-                                    other
-                                );
-                                last_err_log = Instant::now();
+                            if !stream_failed_for_err.swap(true, Ordering::Relaxed) {
+                                eprintln!("cpal output stream error, rebuilding: {}", other);
                             }
                         }
                     }

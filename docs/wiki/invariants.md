@@ -1031,57 +1031,63 @@ Source: [`../../third_party/alsa-rs/src/pcm.rs`](../../third_party/alsa-rs/src/p
 
 ### 48. Capture opens a large (~100 ms) ALSA buffer, not `BufferSize::Default`
 
-`soundcard::spawn` (capture) requests `BufferSize::Fixed(stream_rate / 10)`
-(~100 ms of frames, floor 1024), falling back to `BufferSize::Default`
-only if the device refuses to build or start with the fixed size. Do not
-"simplify" this back to an unconditional `BufferSize::Default`.
+`soundcard::spawn` (capture) requests `BufferSize::Fixed(stream_rate / 4)`
+(~250 ms period, floor 2048), falling back to `BufferSize::Default` only if
+the device refuses to build or start with the fixed size. Do not "simplify"
+this back to an unconditional `BufferSize::Default` or shrink it materially.
 
-*Why:* cpal's `Default` opens a small ALSA period. On a single-core
-low-power host (Raspberry Pi Zero / ARMv6, no NEON) the cpal capture
-thread is starved by the Go runtime + the AFSK demod long enough to
-overrun that small buffer before it is drained -- surfacing as
-`cpal input stream error: Buffer overrun/overrun occurred` followed by
-`rebuilding`, on a ~5 s backoff cycle, with RX dead. The *same hardware*
-captures cleanly under `arecord` (which uses a large buffer by default)
-and the codec advertises native mono `I16` at 48 kHz, so this is neither
-a format (invariant 33) nor a rate (invariant 32) problem -- it is purely
-the capture buffer being too small to absorb scheduling jitter. A ~100 ms
-buffer gives the demod the same slack `arecord` has. Latency is irrelevant
-for the RX path. The fallback exists because some hosts/devices reject a
-fixed period; the retry only changes the buffer request, so it cannot loop
-forever. The output path is left on `Default` -- TX has no analogous
-overrun and a large output buffer would add PTT-to-audio latency.
+*Why:* cpal double-buffers `BufferSize::Fixed(x)` as period=`x`, buffer=`2x`
+(`cpal-0.17.3/src/host/alsa/mod.rs`), so the slack before an overrun is one
+period. cpal's `Default` opens a *small* ALSA period; on a single-core
+low-power host (Raspberry Pi Zero / ARMv6, no NEON) a periodic stall (Go
+runtime / AFSK demod burst) longer than that slack overruns the capture,
+surfacing as an ALSA XRUN/`POLLERR`. The *same hardware* captures cleanly
+under `arecord` -- including *under full graywolf load* -- because
+`arecord`'s default buffer is ~500 ms; and the codec advertises native mono
+`I16` at 48 kHz, so this is neither a format (invariant 33) nor a rate
+(invariant 32) problem. A ~250 ms period (=> ~500 ms buffer, ~250 ms slack)
+matches `arecord`. Latency is irrelevant for the RX path. The fallback
+exists because some plug PCMs reject a fixed period (the Pi Zero CM108's
+`plughw:` rejects it; raw `hw:` accepts it); the retry only changes the
+buffer request, so it cannot loop forever. The output path is left on
+`Default` -- a large output buffer would add PTT-to-audio latency.
 
 Source: [`../../graywolf-modem/src/audio/soundcard.rs`](../../graywolf-modem/src/audio/soundcard.rs)
 (`spawn` -- `target_period`, `buffer_size` fallback in the build/play arms).
 
-### 49. Only rebuild a cpal stream on a *fatal* error, never on a recoverable glitch
+### 49. Rebuild a cpal stream on POLLERR (cpal can't recover it); skip rebuild only for `BufferUnderrun`
 
 The cpal stream error callbacks in `soundcard::spawn` (capture) and
 `soundcard::spawn_output` (playback) must set the `stream_failed` flag
-(which makes the holding thread drop and rebuild the stream) **only** for
-`StreamError::DeviceNotAvailable` and `StreamError::StreamInvalidated`.
-For `StreamError::BufferUnderrun` and `StreamError::BackendSpecific`
-(which is where an ALSA `POLLERR` and recovered XRUNs arrive) the callback
-must just log (throttled) and return -- do **not** rebuild.
+(which makes the holding thread drop and reopen the stream) for
+`StreamError::DeviceNotAvailable`, `StreamError::StreamInvalidated`, **and**
+`StreamError::BackendSpecific` (where ALSA `POLLERR` lands). They must
+**not** rebuild for `StreamError::BufferUnderrun`. Dedup the rebuild log to
+one line per cycle via `stream_failed.swap(true)`.
 
-*Why:* cpal's ALSA worker does **not** die on these -- it reports the
-error via the callback and **keeps polling**, recovering in place exactly
-as `arecord`/`aplay` do (`cpal-0.17.3/src/host/alsa/mod.rs`,
-`input_stream_worker`/`output_stream_worker` map a poll error to
-`error_callback(...)` + `PollDescriptorsFlow::Continue`, and the `XRun`
-arm calls `try_recover`). The old wrapper set `stream_failed` on *every*
-error, so a single transient `POLLERR` tore down a stream cpal would have
-kept -- and on a flaky USB codec (Pi Zero CM108) the teardown/rebuild
-churn itself provoked `POLLERR` storms: ~8 errors, rebuild, ~2 s later
-another, RX/TX usable only in 2-second windows. The tell was that
-`arecord` captured the *same device under full graywolf load* cleanly for
-15 s while graywolf thrashed -- proving the device was fine and the
-wrapper was the problem. Note the original F32 case (invariant 33) was a
-*non*-recoverable POLLERR-every-period; the rebuild loop never fixed that
-either (it rebuilt with the same bad format) -- format/rate selection did.
-So rebuild-on-glitch had no upside and a large downside; it is now scoped
-to genuine device loss.
+*Why:* cpal's ALSA worker handles these two classes differently, and the
+distinction is the whole bug. A `BufferUnderrun` (ALSA `EPIPE` on
+`avail()`/`writei`) is recovered *in place* by cpal -- the `XRun` arm calls
+`prepare()`/`try_recover` -- so rebuilding it would needlessly churn the
+device. But a `POLLERR` in `revents` is **not** recovered: cpal reports it
+via the callback and just keeps polling, and the PCM stays wedged in the
+error state, returning `POLLERR` every period **forever**. cpal has no
+in-place recovery for that path (it would need `snd_pcm_recover`, which
+isn't called), so our rebuild (drop + reopen -> a fresh PREPARED PCM) is
+the *only* recovery -- analogous to what `arecord`/`aplay` do internally.
+
+This was learned the hard way. The first wrapper rebuilt on *every* error,
+which (with the F32 format bug, invariant 33) caused `POLLERR`-storm
+rebuild loops. Over-correcting, a later version logged-and-continued on
+`BackendSpecific` too -- which left a single `POLLERR` wedging RX/TX
+permanently (continuous `POLLERR`, no recovery). The correct split is the
+above: recover `BufferUnderrun` in place (no rebuild), reopen on `POLLERR`
+(rebuild). On a marginal host the real cure for *frequent* `POLLERR` is to
+stop the XRUN happening at all -- a large capture buffer (invariant 48) and
+host USB tuning (`dwc_otg.speed=1`, powered hub) -- not the recovery path;
+this invariant only governs recovering correctly when one does occur.
 
 Source: [`../../graywolf-modem/src/audio/soundcard.rs`](../../graywolf-modem/src/audio/soundcard.rs)
-(`spawn` / `spawn_output` -- the `err_fn` match on `cpal::StreamError`).
+(`spawn` / `spawn_output` -- the `err_fn` match on `cpal::StreamError`),
+[`cpal-0.17.3/src/host/alsa/mod.rs`] (`poll_descriptors_and_prepare_buffer`
+ERR branch, `input_stream_worker`/`output_stream_worker` `XRun` arm).
