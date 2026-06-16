@@ -219,11 +219,15 @@ pub fn spawn(
         |d| d.supported_input_configs(),
     )?;
 
-    let stream_config = StreamConfig {
-        channels,
-        sample_rate: stream_rate,
-        buffer_size: cpal::BufferSize::Default,
-    };
+    // Capture buffer (ALSA period) target: ~100 ms of frames. cpal's
+    // BufferSize::Default opens a small ALSA buffer; on a single-core
+    // low-power host (Pi Zero / ARMv6) the cpal capture thread gets starved
+    // by the Go runtime + demod threads long enough to overrun that small
+    // buffer, which surfaces as "Buffer overrun occurred" and a crash-rebuild
+    // loop with RX dead. A larger buffer gives the same slack `arecord` uses
+    // by default. Built per stream-(re)build below so we can fall back to
+    // BufferSize::Default if a device rejects the fixed size.
+    let target_period: u32 = (stream_rate / 10).max(1024);
 
     let want_ch = cfg.audio_channel as usize;
     let stop = Arc::new(AtomicBool::new(false));
@@ -259,12 +263,21 @@ pub fn spawn(
             let mut ready_tx = Some(ready_tx);
             let mut backoff_idx: usize = 0;
             let mut last_failure: Option<Instant> = None;
+            // Start with the larger fixed buffer; downgrade to Default only if
+            // the device refuses to build with it (see the build-error arm).
+            let mut buffer_size = cpal::BufferSize::Fixed(target_period);
 
             while !stop_for_thread.load(Ordering::Relaxed) {
                 let stream_failed_for_err = stream_failed_for_thread.clone();
                 let err_fn = move |e| {
                     eprintln!("cpal input stream error: {}", e);
                     stream_failed_for_err.store(true, Ordering::Relaxed);
+                };
+
+                let stream_config = StreamConfig {
+                    channels,
+                    sample_rate: stream_rate,
+                    buffer_size,
                 };
 
                 let build_result: Result<cpal::Stream, cpal::BuildStreamError> = match sample_format {
@@ -317,6 +330,18 @@ pub fn spawn(
                 let stream = match build_result {
                     Ok(s) => s,
                     Err(e) => {
+                        // A device that rejects the fixed buffer size: drop
+                        // back to cpal's default and retry immediately rather
+                        // than failing the whole capture path. Only the buffer
+                        // request changes, so this can't loop forever.
+                        if matches!(buffer_size, cpal::BufferSize::Fixed(_)) {
+                            eprintln!(
+                                "cpal input: fixed buffer ({} frames) rejected ({}); retrying with default buffer",
+                                target_period, e
+                            );
+                            buffer_size = cpal::BufferSize::Default;
+                            continue;
+                        }
                         if let Some(tx) = ready_tx.take() {
                             // First attempt failed — surface to caller so
                             // spawn() can return an error instead of
@@ -331,12 +356,22 @@ pub fn spawn(
                     }
                 };
                 if let Err(e) = stream.play() {
+                    drop(stream);
+                    // Same fallback as the build path: a fixed-buffer stream
+                    // that builds but won't start drops to the default buffer.
+                    if matches!(buffer_size, cpal::BufferSize::Fixed(_)) {
+                        eprintln!(
+                            "cpal input: fixed-buffer stream play failed ({}); retrying with default buffer",
+                            e
+                        );
+                        buffer_size = cpal::BufferSize::Default;
+                        continue;
+                    }
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Err(format!("input stream play: {}", e)));
                         return;
                     }
                     eprintln!("cpal rebuild input stream play failed: {}", e);
-                    drop(stream);
                     backoff_wait(&mut backoff_idx, &stop_for_thread);
                     last_failure = Some(Instant::now());
                     continue;

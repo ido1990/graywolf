@@ -1028,3 +1028,29 @@ Source: [`../../third_party/alsa-rs/src/pcm.rs`](../../third_party/alsa-rs/src/p
 (`decode_htstamp`, `Htstamp64`, `Status::get_htstamp`),
 [`../../Cargo.toml`](../../Cargo.toml) (`[patch.crates-io] alsa`, `workspace.exclude`),
 [`docs/plans/2026-06-11-armhf-t64-alsa-htstamp-fix.md`](../plans/2026-06-11-armhf-t64-alsa-htstamp-fix.md).
+
+### 48. Capture opens a large (~100 ms) ALSA buffer, not `BufferSize::Default`
+
+`soundcard::spawn` (capture) requests `BufferSize::Fixed(stream_rate / 10)`
+(~100 ms of frames, floor 1024), falling back to `BufferSize::Default`
+only if the device refuses to build or start with the fixed size. Do not
+"simplify" this back to an unconditional `BufferSize::Default`.
+
+*Why:* cpal's `Default` opens a small ALSA period. On a single-core
+low-power host (Raspberry Pi Zero / ARMv6, no NEON) the cpal capture
+thread is starved by the Go runtime + the AFSK demod long enough to
+overrun that small buffer before it is drained -- surfacing as
+`cpal input stream error: Buffer overrun/overrun occurred` followed by
+`rebuilding`, on a ~5 s backoff cycle, with RX dead. The *same hardware*
+captures cleanly under `arecord` (which uses a large buffer by default)
+and the codec advertises native mono `I16` at 48 kHz, so this is neither
+a format (invariant 33) nor a rate (invariant 32) problem -- it is purely
+the capture buffer being too small to absorb scheduling jitter. A ~100 ms
+buffer gives the demod the same slack `arecord` has. Latency is irrelevant
+for the RX path. The fallback exists because some hosts/devices reject a
+fixed period; the retry only changes the buffer request, so it cannot loop
+forever. The output path is left on `Default` -- TX has no analogous
+overrun and a large output buffer would add PTT-to-audio latency.
+
+Source: [`../../graywolf-modem/src/audio/soundcard.rs`](../../graywolf-modem/src/audio/soundcard.rs)
+(`spawn` -- `target_period`, `buffer_size` fallback in the build/play arms).
