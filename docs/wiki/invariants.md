@@ -1054,3 +1054,34 @@ overrun and a large output buffer would add PTT-to-audio latency.
 
 Source: [`../../graywolf-modem/src/audio/soundcard.rs`](../../graywolf-modem/src/audio/soundcard.rs)
 (`spawn` -- `target_period`, `buffer_size` fallback in the build/play arms).
+
+### 49. Only rebuild a cpal stream on a *fatal* error, never on a recoverable glitch
+
+The cpal stream error callbacks in `soundcard::spawn` (capture) and
+`soundcard::spawn_output` (playback) must set the `stream_failed` flag
+(which makes the holding thread drop and rebuild the stream) **only** for
+`StreamError::DeviceNotAvailable` and `StreamError::StreamInvalidated`.
+For `StreamError::BufferUnderrun` and `StreamError::BackendSpecific`
+(which is where an ALSA `POLLERR` and recovered XRUNs arrive) the callback
+must just log (throttled) and return -- do **not** rebuild.
+
+*Why:* cpal's ALSA worker does **not** die on these -- it reports the
+error via the callback and **keeps polling**, recovering in place exactly
+as `arecord`/`aplay` do (`cpal-0.17.3/src/host/alsa/mod.rs`,
+`input_stream_worker`/`output_stream_worker` map a poll error to
+`error_callback(...)` + `PollDescriptorsFlow::Continue`, and the `XRun`
+arm calls `try_recover`). The old wrapper set `stream_failed` on *every*
+error, so a single transient `POLLERR` tore down a stream cpal would have
+kept -- and on a flaky USB codec (Pi Zero CM108) the teardown/rebuild
+churn itself provoked `POLLERR` storms: ~8 errors, rebuild, ~2 s later
+another, RX/TX usable only in 2-second windows. The tell was that
+`arecord` captured the *same device under full graywolf load* cleanly for
+15 s while graywolf thrashed -- proving the device was fine and the
+wrapper was the problem. Note the original F32 case (invariant 33) was a
+*non*-recoverable POLLERR-every-period; the rebuild loop never fixed that
+either (it rebuilt with the same bad format) -- format/rate selection did.
+So rebuild-on-glitch had no upside and a large downside; it is now scoped
+to genuine device loss.
+
+Source: [`../../graywolf-modem/src/audio/soundcard.rs`](../../graywolf-modem/src/audio/soundcard.rs)
+(`spawn` / `spawn_output` -- the `err_fn` match on `cpal::StreamError`).

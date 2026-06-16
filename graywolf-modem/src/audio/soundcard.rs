@@ -269,9 +269,35 @@ pub fn spawn(
 
             while !stop_for_thread.load(Ordering::Relaxed) {
                 let stream_failed_for_err = stream_failed_for_thread.clone();
-                let err_fn = move |e| {
-                    eprintln!("cpal input stream error: {}", e);
-                    stream_failed_for_err.store(true, Ordering::Relaxed);
+                let mut last_err_log = Instant::now()
+                    .checked_sub(Duration::from_secs(5))
+                    .unwrap_or_else(Instant::now);
+                let err_fn = move |e: cpal::StreamError| {
+                    match e {
+                        // Genuinely fatal: the device vanished or cpal says the
+                        // stream must be rebuilt. Trigger our rebuild path.
+                        cpal::StreamError::DeviceNotAvailable
+                        | cpal::StreamError::StreamInvalidated => {
+                            eprintln!("cpal input stream needs rebuild: {}", e);
+                            stream_failed_for_err.store(true, Ordering::Relaxed);
+                        }
+                        // Recoverable glitch (BufferUnderrun / BackendSpecific,
+                        // which is where ALSA POLLERR + XRUN land): cpal keeps
+                        // the stream alive and recovers in place, exactly as
+                        // arecord/aplay do. Tearing it down to rebuild here only
+                        // churns the device and, on a flaky USB codec (Pi Zero
+                        // CM108), provokes POLLERR storms. Log (throttled) and
+                        // let cpal recover -- invariant 49.
+                        other => {
+                            if last_err_log.elapsed() >= Duration::from_secs(5) {
+                                eprintln!(
+                                    "cpal input stream glitch (recovering in place): {}",
+                                    other
+                                );
+                                last_err_log = Instant::now();
+                            }
+                        }
+                    }
                 };
 
                 let stream_config = StreamConfig {
@@ -1142,9 +1168,32 @@ pub fn spawn_output(cfg: SoundcardOutputConfig, device: Option<Device>) -> Resul
 
             while !stop_for_thread.load(Ordering::Relaxed) {
                 let stream_failed_for_err = stream_failed_for_thread.clone();
-                let err_fn = move |e| {
-                    eprintln!("cpal output stream error: {}", e);
-                    stream_failed_for_err.store(true, Ordering::Relaxed);
+                let mut last_err_log = Instant::now()
+                    .checked_sub(Duration::from_secs(5))
+                    .unwrap_or_else(Instant::now);
+                let err_fn = move |e: cpal::StreamError| {
+                    match e {
+                        // Fatal: device gone / stream invalidated -> rebuild.
+                        cpal::StreamError::DeviceNotAvailable
+                        | cpal::StreamError::StreamInvalidated => {
+                            eprintln!("cpal output stream needs rebuild: {}", e);
+                            stream_failed_for_err.store(true, Ordering::Relaxed);
+                        }
+                        // Recoverable (BufferUnderrun / BackendSpecific incl.
+                        // ALSA POLLERR + XRUN): cpal recovers in place like
+                        // aplay. Don't tear down -- a rebuild mid-transmission
+                        // truncates TX audio and churns a flaky USB codec.
+                        // Log (throttled) and let cpal recover -- invariant 49.
+                        other => {
+                            if last_err_log.elapsed() >= Duration::from_secs(5) {
+                                eprintln!(
+                                    "cpal output stream glitch (recovering in place): {}",
+                                    other
+                                );
+                                last_err_log = Instant::now();
+                            }
+                        }
+                    }
                 };
 
                 let mut state = OutputState::new(
