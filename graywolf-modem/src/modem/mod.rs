@@ -1334,6 +1334,24 @@ fn create_demod(ccfg: &ChannelConfig, sample_rate: u32) -> ChannelDemod {
             } else {
                 ccfg.demod_ensemble.as_str()
             };
+            // Operator override: GRAYWOLF_DEMOD_ENSEMBLE=single|dual|triple
+            // forces the demod architecture regardless of the per-channel
+            // config. This exists for constrained hosts (e.g. a 1 GHz ARMv6
+            // Pi Zero with no NEON, where the default 27-slicer "triple" pegs
+            // the single core and starves the rest of the service) and for
+            // mixed installs whose Go side predates the per-channel setting.
+            // Recognized values only; anything else is ignored.
+            let env_override = std::env::var("GRAYWOLF_DEMOD_ENSEMBLE").ok();
+            let effective = match env_override.as_deref() {
+                Some(v @ ("single" | "dual" | "triple")) => {
+                    eprintln!(
+                        "graywolf-modem: GRAYWOLF_DEMOD_ENSEMBLE={} overrides channel {} demod ensemble ({})",
+                        v, ccfg.channel, effective
+                    );
+                    v
+                }
+                _ => effective,
+            };
             match effective {
                 "dual" | "triple" => {
                     let preset: &[MultiConfig] = match effective {

@@ -15,6 +15,18 @@ operator overview: [`../handbook/architecture.html`](../handbook/architecture.ht
 sibling of the graywolf binary, `./target/release/graywolf-modem`, `$PATH`
 ([`../../pkg/app/modem.go`](../../pkg/app/modem.go)).
 
+The modem honors one operator env var (inherited from the `graywolf`
+process, so set it in the systemd unit): **`GRAYWOLF_DEMOD_ENSEMBLE`** =
+`single` | `dual` | `triple`. When set to a recognized value it overrides
+the per-channel `demod_ensemble` for *every* AFSK channel. Purpose: force
+the light `single` demod on constrained hosts -- a 1 GHz ARMv6 Pi Zero (no
+NEON) cannot run the default `triple` ensemble (3 profiles x 9 slicers = 27
+slicers @ 48 kHz) without pegging its single core, which starves the Go web
+server and the capture thread. Also useful on mixed installs whose Go side
+predates the per-channel setting. Source:
+[`../../graywolf-modem/src/modem/mod.rs`](../../graywolf-modem/src/modem/mod.rs)
+(`create_demod`).
+
 ## Web surface
 
 | Item | Value | Source |
