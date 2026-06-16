@@ -988,3 +988,43 @@ Source: [`../../graywolf-modem/src/demod_afsk.rs`](../../graywolf-modem/src/demo
 (`process_profile_a`, `process_profile_b`, `track_level`),
 [`../../graywolf-modem/src/demod_afsk_multi.rs`](../../graywolf-modem/src/demod_afsk_multi.rs)
 (dedup in `process_sample`).
+
+### 47. The vendored `alsa` crate must report a zero htstamp
+
+`alsa` is patched workspace-wide via `[patch.crates-io]` to the vendored
+crate at [`../../third_party/alsa-rs`](../../third_party/alsa-rs) (a fork
+of `diwic/alsa-rs` 0.11.0). Its `Status` htstamp accessors
+(`get_htstamp` / `get_trigger_htstamp` / `get_audio_htstamp`) must (a)
+read into a **16-byte** buffer and (b) return **`(0, 0)`** via
+`decode_htstamp`. Do not "restore" the real decoded value.
+
+*Why, two stacked 32-bit-ARM bugs on current Raspberry Pi OS (issue #231):*
+
+1. **t64 stack smash.** Debian's time64 transition rebuilt 32-bit
+   `libasound2` with a 16-byte `struct timespec`; stock alsa-rs reads it
+   into an 8-byte `libc::timespec` and smashes the stack -> SIGSEGV
+   crash-loop ~0.3 s into capture. The 16-byte buffer fixes that.
+
+2. **cpal i32 htstamp overflow.** cpal's ALSA backend probes
+   `get_htstamp()` once at stream build: a zero value selects its safe
+   software-timestamp fallback (`Instant`-since-creation); a non-zero
+   value commits it to the **hardware** path, where it computes
+   `ts.tv_sec * 1_000_000_000` in **i32**. On 32-bit that overflows for
+   any uptime over ~2 s, goes negative, and cpal errors
+   `get_htstamp ... was earlier than get_trigger_htstamp` **every
+   period** -> the stream's error callback fires -> the holding thread
+   crash-rebuilds forever and audio (TX *and* the collateral-disrupted
+   shared-card RX) goes silent. Returning `(0, 0)` keeps cpal on the
+   software fallback, dodging the overflow entirely.
+
+graywolf ignores cpal's callback timestamps (every `build_*_stream`
+closure binds the info arg as `_`), so reporting zero costs nothing. The
+original t64 design doc assumed the decoded value was simply discarded;
+it missed that cpal *validates* it internally before discarding -- which
+is the whole of bug 2. Drop the vendored crate only once both fixes are
+upstream in a published `alsa` release.
+
+Source: [`../../third_party/alsa-rs/src/pcm.rs`](../../third_party/alsa-rs/src/pcm.rs)
+(`decode_htstamp`, `Htstamp64`, `Status::get_htstamp`),
+[`../../Cargo.toml`](../../Cargo.toml) (`[patch.crates-io] alsa`, `workspace.exclude`),
+[`docs/plans/2026-06-11-armhf-t64-alsa-htstamp-fix.md`](../plans/2026-06-11-armhf-t64-alsa-htstamp-fix.md).

@@ -296,3 +296,28 @@ The actual t64 overflow only manifests under Layer 2 (QEMU) / Layer 3 (hardware)
 - **`get_audio_htstamp` width.** Audio htstamp is also a `timespec` in alsa-rs;
   same 16-byte treatment. Confirm there is no other `Status` accessor returning a
   bare `timespec` that cpal touches (current alsa-rs: just the three).
+
+---
+
+## 11. Follow-up (2026-06-16): the 16-byte buffer was necessary but not sufficient
+
+Section 5's premise -- "graywolf discards cpal's timestamps, so a lossy value is
+harmless" -- was incomplete. cpal does not just hand the value to the callback;
+its ALSA backend **validates and arithmetic-processes** it first, and that step
+overflows on 32-bit:
+
+- cpal probes `get_htstamp()` once at stream build. A **zero** value selects the
+  software-timestamp fallback (`Instant`-since-creation); a **non-zero** value
+  commits cpal to the hardware path for every callback.
+- The 16-byte-buffer fix returned the *real* (non-zero) monotonic htstamp, so on
+  the Pi Zero cpal took the hardware path and computed `ts.tv_sec * 1e9` in
+  **i32** (`timespec_to_nanos`, `cpal-0.17.3/src/host/alsa/mod.rs`). For any
+  uptime over ~2 s this overflows negative, and cpal errors
+  `get_htstamp ... was earlier than get_trigger_htstamp` every period -- a
+  crash-rebuild loop that silenced TX (and collaterally the shared-card RX).
+
+Fix: `decode_htstamp` now returns `(0, 0)`, putting cpal back on the software
+fallback. This is strictly within section 5's tolerance (the value is discarded)
+and also makes the overflow unreachable. The fork was **vendored** into
+`third_party/alsa-rs` and `[patch.crates-io] alsa` repointed there (also removes
+the git-fetch dependency from `cross` builds). Locked in by invariant 47.

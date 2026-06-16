@@ -14,7 +14,6 @@ dependencies = [
 [[package]]
 name = "alsa"
 version = "0.11.0"
-source = "git+https://github.com/chrissnell/alsa-rs?rev=bd0668715753072e3ef74097a1bd65e96845fa7b#bd0668715753072e3ef74097a1bd65e96845fa7b"
 dependencies = [
  "alsa-sys",
  "bitflags",
