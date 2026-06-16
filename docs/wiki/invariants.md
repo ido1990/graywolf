@@ -1091,3 +1091,30 @@ Source: [`../../graywolf-modem/src/audio/soundcard.rs`](../../graywolf-modem/src
 (`spawn` / `spawn_output` -- the `err_fn` match on `cpal::StreamError`),
 [`cpal-0.17.3/src/host/alsa/mod.rs`] (`poll_descriptors_and_prepare_buffer`
 ERR branch, `input_stream_worker`/`output_stream_worker` `XRun` arm).
+
+### 50. Output sinks are idle-closed; the resolved device handle is kept for reopen
+
+The TX worker (`tx_worker::worker_loop`) closes an output `AudioSink` after
+`SINK_IDLE_CLOSE` (2 s) with no transmission on that device, and reopens it
+on the next TX. To make reopen safe, `process_job` **clones** the
+pre-resolved cpal `Device` from `pending_devices` (it must not `remove`/
+consume it). Do not revert to a permanently-open output sink.
+
+*Why:* a USB playback stream held open while idle drifts (codec vs host
+clock) into an XRUN that arrives as `POLLERR`, which cpal cannot recover in
+place (invariant 49), so the holding thread rebuild-loops every few seconds
+forever -- and a rebuild colliding with the next TX truncates it (observed
+`TransmitFrame: drain timeout`). Closing the stream when idle removes the
+thing that POLLERRs. Reopen must not re-enumerate the device list (cpal
+enumeration can fail while the input PCM is captured on the same card),
+hence the cached `Device` clone -- `spawn_output` still negotiates channels/
+format at open, the same path the first TX already uses successfully. The
+2 s window is longer than a typical digipeat burst, so back-to-back frames
+reuse one open stream; only genuine idle triggers a close. (The prior
+direwolf-style "keep the output device continuously open" comment on
+`AudioSink` describes the *sink's* lifetime; the worker now scopes that
+lifetime to active TX.)
+
+Source: [`../../graywolf-modem/src/modem/tx_worker.rs`](../../graywolf-modem/src/modem/tx_worker.rs)
+(`worker_loop` idle-close in the `RecvTimeout` arm, `SINK_IDLE_CLOSE`,
+`process_job` device clone).

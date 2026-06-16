@@ -220,16 +220,34 @@ impl Drop for TxWorker {
     }
 }
 
+/// How long an output sink may sit idle (no transmissions) before the worker
+/// closes it. Holding a USB playback stream open while idle lets the codec's
+/// clock drift into an XRUN/POLLERR that cpal can't recover in place, forcing
+/// a rebuild loop (and the rebuild can collide with the next TX, truncating
+/// it). Closing the stream when idle removes the thing that POLLERRs; the next
+/// TX reopens it (fast, from the cached device handle). Longer than a typical
+/// digipeat burst so back-to-back frames keep one stream open.
+#[cfg(not(target_os = "android"))]
+const SINK_IDLE_CLOSE: Duration = Duration::from_secs(2);
+
 fn worker_loop(rx: std::sync::mpsc::Receiver<TxMessage>, stop: Arc<AtomicBool>) {
     let mut sinks: HashMap<u32, AudioSink> = HashMap::new();
     let mut drivers: HashMap<u32, Box<dyn PttDriver>> = HashMap::new();
     // Pre-resolved cpal output devices, keyed by device_id. Populated by
-    // PrepareOutput before any input streams open; consumed on first TX.
+    // PrepareOutput before any input streams open; cloned (not consumed) on
+    // each sink open so a sink can be reopened after an idle-close.
     let mut pending_devices: HashMap<u32, Device> = HashMap::new();
+    // Last transmit time per output device_id, for idle-close.
+    #[cfg(not(target_os = "android"))]
+    let mut last_tx: HashMap<u32, Instant> = HashMap::new();
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(TxMessage::Transmit(job)) => {
+                #[cfg(not(target_os = "android"))]
+                let dev_id = job.output_device_id;
                 process_job(&mut sinks, &mut drivers, &mut pending_devices, job);
+                #[cfg(not(target_os = "android"))]
+                last_tx.insert(dev_id, Instant::now());
             }
             Ok(TxMessage::RegisterDriver { channel, driver }) => {
                 drivers.insert(channel, driver);
@@ -243,6 +261,8 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<TxMessage>, stop: Arc<AtomicBool>) 
             Ok(TxMessage::ReleaseSinks) => {
                 sinks.clear();
                 pending_devices.clear();
+                #[cfg(not(target_os = "android"))]
+                last_tx.clear();
             }
             Ok(TxMessage::ManualKey { channel, keyed }) => {
                 match drivers.get_mut(&channel) {
@@ -271,7 +291,29 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<TxMessage>, stop: Arc<AtomicBool>) 
             Ok(TxMessage::QueryDriverCount(reply)) => {
                 let _ = reply.send(drivers.len());
             }
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // Close any output sink that has been idle past the threshold
+                // so it can't sit open and POLLERR on USB clock drift. The
+                // next TX reopens it from the cached device handle.
+                #[cfg(not(target_os = "android"))]
+                {
+                    let now = Instant::now();
+                    let idle: Vec<u32> = sinks
+                        .keys()
+                        .copied()
+                        .filter(|id| {
+                            last_tx
+                                .get(id)
+                                .is_none_or(|t| now.duration_since(*t) >= SINK_IDLE_CLOSE)
+                        })
+                        .collect();
+                    for id in idle {
+                        sinks.remove(&id); // drop closes the cpal stream
+                        last_tx.remove(&id);
+                        eprintln!("graywolf-modem: closed idle TX sink device_id={}", id);
+                    }
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -350,7 +392,10 @@ fn process_job(
         let sink = match sinks.entry(output_device_id) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let device = pending_devices.remove(&output_device_id);
+                // Clone (don't consume) the pre-resolved device so the sink
+                // can be reopened after an idle-close without re-enumerating
+                // (enumeration can fail while the input PCM is captured).
+                let device = pending_devices.get(&output_device_id).cloned();
                 match soundcard::spawn_output(sink_config, device) {
                     Ok(s) => {
                         eprintln!(
